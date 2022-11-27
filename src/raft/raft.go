@@ -18,6 +18,10 @@ package raft
 //
 
 import (
+	"6.824/mylog"
+	"math/rand"
+	"time"
+
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -49,30 +53,65 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+const (
+	FOLLOWER = iota
+	CANDIDATE
+	LEADER
+)
+
 //
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
+	mu             sync.Mutex          // Lock to protect shared access to this peer's state
+	peers          []*labrpc.ClientEnd // RPC end points of all peers
+	persister      *Persister          // Object to hold this peer's persisted state
+	me             int                 // this peer's index into peers[]
+	dead           int32               // set by Kill()
+	role           int                 //当前服务器的角色
+	candidateTimer int
+	pingMaxTime    int //单位毫秒
+	maxReplyTime   int //单位毫秒
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	//所有服务器都有的状态（persistent)
+	currentTerm int        //服务器当前term
+	votedFor    int        //当前term下，收到选票的候选者id
+	log         []LogEntry //log数组，包括指令和收到指令时的term
+
+	//所有服务器都有的状态（volatile)
+	commitIndex int //已知的log数组中的最大下标
+	lastApplied int //当前服务器的log数组下标
+
+	//leaders的状态(volatile)
+	nextIndex  []int //所有服务器的log数组中下一个下标
+	matchIndex []int //所有服务器已知的log数组中的最大下标
+}
+
+type Role struct {
+	role int
+	mu   sync.Mutex
+}
+
+type LogEntry struct {
+	commend string
+	term    int
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	role := rf.role
+
+	return rf.currentTerm, role == LEADER
 }
 
 //
@@ -139,6 +178,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -147,6 +190,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -154,6 +199,51 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
+	if rf.killed() {
+		return
+	}
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId && rf.lastApplied <= args.LastLogIndex {
+		reply.Term = args.Term
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
+		rf.currentTerm = args.Term - 1
+
+		mylog.Infof("me:%v term:%v votes for:%v \n", rf.me, rf.currentTerm, args.CandidateId)
+		rf.role = FOLLOWER
+		rf.candidateTimer = 0
+
+		return
+	}
+}
+
+type PingArgs struct {
+	Term int //leader当前term
+	Me   int //发起ping的id
+}
+
+type PingReply struct {
+	Term int // follower或者candidate返回的term
+}
+
+func (rf *Raft) Ping(args *PingArgs, reply *PingReply) {
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
+	rf.candidateTimer = 0
+	if args.Term >= rf.currentTerm {
+		rf.role = FOLLOWER
+		rf.currentTerm = args.Term
+		rf.votedFor = args.Me
+	}
+	reply.Term = rf.currentTerm
+	//rf.role = FOLLOWER
+	//mylog.Infof("me:%v ping me:%v\n", args.Me, rf.me)
 }
 
 //
@@ -228,6 +318,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.role = FOLLOWER
+	rf.votedFor = -1
 }
 
 func (rf *Raft) killed() bool {
@@ -239,6 +333,61 @@ func (rf *Raft) killed() bool {
 // heartsbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
+		rf.mu.Lock()
+		if rf.role == CANDIDATE {
+			requestVoteArgs := &RequestVoteArgs{
+				Term:         rf.currentTerm,
+				CandidateId:  rf.me,
+				LastLogIndex: rf.lastApplied,
+				LastLogTerm:  0,
+			}
+			count := 0 //获得的选票数
+			for i, peer := range rf.peers {
+				requestVoteReply := &RequestVoteReply{Term: rf.currentTerm}
+				if i == rf.me {
+					continue
+				}
+				if !peer.Call("Raft.RequestVote", requestVoteArgs, requestVoteReply) {
+					continue
+				}
+				if requestVoteReply.VoteGranted {
+					count++
+				} else if requestVoteReply.Term > rf.currentTerm {
+					rf.currentTerm = requestVoteReply.Term
+					//rf.role = FOLLOWER
+					break
+				}
+			}
+			mylog.Infof("me: %v 当前term:%v 被投票数: %v\n", rf.me, rf.currentTerm, count)
+			if count+1 > len(rf.peers)/2 {
+				mylog.Infof("me: %v len: %v term: %v", rf.me, len(rf.peers), rf.currentTerm)
+				rf.role = LEADER
+			} else {
+				rf.votedFor = -1
+			}
+			//time.Sleep(time.Duration(rf.maxReplyTime) * time.Millisecond) //等待结果返回
+		}
+		if rf.role == LEADER {
+			for i, peer := range rf.peers {
+				if i != rf.me {
+					args := &PingArgs{Term: rf.currentTerm,
+						Me: rf.me}
+					reply := &PingReply{}
+					if !peer.Call("Raft.Ping", args, reply) {
+						continue
+					}
+					if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term - 1
+						rf.role = FOLLOWER
+						rf.votedFor = -1
+						break
+					}
+				}
+			}
+		}
+		rf.mu.Unlock()
+
+		//time.Sleep(time.Duration(rand.Int()%100) * time.Millisecond)
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
@@ -264,14 +413,54 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
+	rf.votedFor = -1
+	rf.maxReplyTime = 200
+	rf.role = FOLLOWER
+	rand.Seed(time.Now().UnixNano())
+	rf.pingMaxTime = rand.Int()%150 + 150 //ping的最长时间在150毫秒到300毫秒之间
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	mylog.SetLevel(mylog.InfoLevel)
+
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
+	go rf.candidate_timer()
 	return rf
+}
+
+// 超时后follower变成candidate
+func (rf *Raft) candidate_timer() {
+	for rf.killed() == false {
+		//mylog.Infof("me %v 等待前timer: %v\n", rf.me, rf.candidateTimer)
+
+		time.Sleep(time.Duration(rand.Int()%800+200) * time.Millisecond)
+		//mylog.Infof("me %v 等待后timer: %v\n", rf.me, rf.candidateTimer)
+
+		rf.mu.Lock()
+		role := rf.role
+
+		if role == LEADER {
+			rf.mu.Unlock()
+			continue
+		}
+		if rf.role == CANDIDATE { //重选举
+			rf.role = FOLLOWER
+			rf.currentTerm--
+			rf.votedFor = -1
+			rf.candidateTimer = 0
+		}
+		if rf.candidateTimer == 1 { //超时
+			//角色变为candidate
+			rf.currentTerm++
+			rf.role = CANDIDATE
+			rf.votedFor = rf.me
+			mylog.Infof("%v 超时，当前term: %v\n", rf.me, rf.currentTerm)
+		}
+		rf.candidateTimer = 1
+		rf.mu.Unlock()
+
+	}
 }
