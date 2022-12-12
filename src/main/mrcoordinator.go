@@ -10,8 +10,8 @@ package main
 //
 
 import (
-	"6.824/mr"
 	"log"
+	"my6.824/mr"
 )
 import "time"
 import "os"

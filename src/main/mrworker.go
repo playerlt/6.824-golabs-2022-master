@@ -10,7 +10,7 @@ package main
 // Please do not change this file.
 //
 
-import "6.824/mr"
+import "my6.824/mr"
 import "plugin"
 import "os"
 import "fmt"

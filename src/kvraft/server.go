@@ -1,10 +1,10 @@
 package kvraft
 
 import (
-	"6.824/labgob"
-	"6.824/labrpc"
-	"6.824/raft"
 	"log"
+	"my6.824/labgob"
+	"my6.824/labrpc"
+	"my6.824/raft"
 	"sync"
 	"sync/atomic"
 )

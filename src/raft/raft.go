@@ -18,13 +18,22 @@ package raft
 //
 
 import (
+	"fmt"
+	rand2 "math/rand"
+	"my6.824/raft/utils/mylog"
+	"time"
+
 	//	"bytes"
 	"sync"
 	"sync/atomic"
-
-	//	"6.824/labgob"
-	"6.824/labrpc"
+	//	"my6.824/labgob"
+	"my6.824/labrpc"
 )
+
+const electWaitMs int = 800
+const electWaitRandomOffsetMs int = 100
+const sendAEWaitMs int = 100
+const logLevel int = mylog.InfoLevel
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -62,7 +71,9 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	stateMachine  *RaftStateMachine
+	electionTimer *Timer
+	sendAETimer   *Timer
 }
 
 // return currentTerm and whether this server
@@ -72,6 +83,12 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	//rf.stateMachine.lockState()
+	rf.stateMachine.rwmu.RLock()
+	term = rf.stateMachine.currentTerm
+	isleader = rf.stateMachine.curState == sendAEState
+	rf.stateMachine.rwmu.RUnlock()
+	//rf.stateMachine.unlockState()
 	return term, isleader
 }
 
@@ -139,6 +156,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term        int
+	CandidateId int
 }
 
 //
@@ -147,6 +166,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -154,6 +175,29 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.stateMachine.rwmu.RLock()
+	defer rf.stateMachine.rwmu.RUnlock()
+
+	reply.VoteGranted = false
+	reply.Term = rf.stateMachine.currentTerm
+
+	var stateBool bool
+	if args.Term > rf.stateMachine.currentTerm {
+		rf.Infof("encounters larger term %d, transfer to follower", args.Term)
+		stateBool = true
+	} else if args.Term < rf.stateMachine.currentTerm {
+		// Reply false if term < currentTerm
+		rf.Infof("reject vote because candidate term %d less than mine %d", args.Term, rf.stateMachine.currentTerm)
+		stateBool = false
+	} else if rf.stateMachine.votedFor == -1 || rf.stateMachine.votedFor == args.CandidateId {
+		stateBool = true
+	} else {
+		stateBool = false
+	}
+	if stateBool {
+		reply.VoteGranted = true
+		rf.stateMachine.issueTransfer(rf.makeLargerTerm(args.Term, args.CandidateId))
+	}
 }
 
 //
@@ -188,6 +232,51 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
+}
+
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderId int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	//rf.stateMachine.Infof("AppendEntries call from %d", args.LeaderId)
+	reply.Success = false
+	//rf.electionTimer.setElectionWait()
+	rf.electionTimer.start()
+
+	rf.stateMachine.rwmu.RLock()
+	defer rf.stateMachine.rwmu.RUnlock()
+
+	rf.Infof("AE recved from %d", args.LeaderId)
+
+	reply.Term = rf.stateMachine.currentTerm
+
+	if args.Term > rf.stateMachine.currentTerm {
+		rf.Infof("encounters larger term %d, transfer to follower", args.Term)
+		rf.stateMachine.issueTransfer(rf.makeLargerTerm(args.Term, args.LeaderId))
+		reply.Success = true
+		//return
+	}
+	// Reply false if term < currentTerm
+	if args.Term < rf.stateMachine.currentTerm {
+		rf.Infof("reply false because leader term %d less than mine %d", args.Term, rf.stateMachine.currentTerm)
+		return
+	}
+
+	//rf.stateMachine.issueTransfer(rf.makeNewAE(args.PrevLogIndex, &args.Entries, args.LeaderCommit))
+
+	reply.Success = true
 }
 
 //
@@ -266,12 +355,39 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-
+	rf.initStateMachine()
+	rf.electionTimer = makeTimer(electWaitMs, rf.makeElectionTimeout(), rf)
+	rf.sendAETimer = makeTimer(sendAEWaitMs, rf.makeMajorElected(), rf)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	// start ticker goroutine to start elections
-	go rf.ticker()
+	//log level
+	mylog.SetLevel(logLevel)
+
+	// start raft stateMachine
+	go func() {
+		randMs := rand2.Int() % 500
+		time.Sleep(time.Duration(randMs) * time.Millisecond)
+
+		rf.stateMachine.rwmu.RLock()
+		rf.Infof("start election timer")
+		rf.stateMachine.rwmu.RUnlock()
+
+		rf.electionTimer.setElectionWait()
+		rf.electionTimer.start()
+		go rf.stateMachine.machineLoop()
+	}()
 
 	return rf
+}
+
+func (rf *Raft) Infof(format string, vars ...interface{}) {
+	s := fmt.Sprintf(format, vars...)
+	mylog.Infof("%d %s term %d votedFor %d  | %s\n", rf.me, rf.stateMachine.stateNameMap[rf.stateMachine.curState], rf.stateMachine.currentTerm, rf.stateMachine.votedFor, s)
+	//mylog.Infof("%d %s term %d votedFor %d lastLogIndex %d lastApplied %d commitIndex %d snap %d | %s\n", rf.me, rf.stateMachine.stateNameMap[rf.stateMachine.curState], rf.stateMachine.currentTerm, rf.stateMachine.votedFor, rf.stateMachine.lastLogIndex(), rf.stateMachine.lastApplied, rf.stateMachine.commitIndex, rf.stateMachine.lastSnapshotIndex, s)
+
+}
+
+func (rf *Raft) peerCount() int {
+	return len(rf.peers)
 }
